@@ -49,16 +49,6 @@ func NewEditDeploymentOptions(streams genericclioptions.IOStreams) *EditDeployOp
 	}
 }
 
-func isFlagPassed(name string) bool {
-	found := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == name {
-			found = true
-		}
-	})
-	return found
-}
-
 //Cobra provides easy cli interface with error handling and easy extensibility(aliases, suggestions, depreciated, etc.) of cli tools
 //https://cobra.dev/
 func NewCmdEdit(streams genericclioptions.IOStreams) *cobra.Command {
@@ -88,10 +78,9 @@ func NewCmdEdit(streams genericclioptions.IOStreams) *cobra.Command {
 
 	//Store newReplicas value in variable
 	cmd.Flags().Int32Var(&o.newReplicas, "replicas", o.newReplicas, "Number of Replicas to set")
-	cmd.Flags().Int32Var(&o.newRhl, "rhl", o.newRhl, "Revision History limit")
+	cmd.Flags().Int32Var(&o.newRhl, "rhl", -1, "Revision History limit")
 	//Add extra flags provided by user
 	o.configFlags.AddFlags(cmd.Flags())
-
 	return cmd
 }
 
@@ -128,10 +117,15 @@ func (o *EditDeployOptions) Complete(cmd *cobra.Command, args []string) error {
 	//If namespace is provided in the flags
 	userSpecifiedNamespace := *o.configFlags.Namespace
 
-	//If not specified use default namespace
+	//If not specified use namespace in current context
 	if len(userSpecifiedNamespace) == 0 {
 		userSpecifiedNamespace = rawconfig.Contexts[rawconfig.CurrentContext].Namespace
 
+	}
+
+	//If current context is empty then use "default" namespace
+	if len(userSpecifiedNamespace) == 0 {
+		userSpecifiedNamespace = "Default"
 	}
 
 	//Get deployment client in the specified namespace
@@ -141,11 +135,11 @@ func (o *EditDeployOptions) Complete(cmd *cobra.Command, args []string) error {
 		return getErr
 	}
 
-	if !isFlagPassed("replicas") {
+	if o.newReplicas <= 0 {
 		o.newReplicas = *result.Spec.Replicas
 	}
 
-	if !isFlagPassed("rhl") {
+	if o.newRhl < 0 {
 		o.newRhl = *result.Spec.RevisionHistoryLimit
 	}
 
@@ -171,77 +165,39 @@ func (o *EditDeployOptions) Validate() error {
 
 //Function to update the deployments
 func (o *EditDeployOptions) Run() error {
-	if len(o.deploymentName) > 0 && o.newReplicas > 0 {
-		//Returns a REST client config from the flags
-		config, err := o.configFlags.ToRESTConfig()
-		if err != nil {
-			return err
-		}
-		println(config)
 
-		//Rawconfig for extracting the current namespace
-		rawconfig, err := o.configFlags.ToRawKubeConfigLoader().RawConfig()
-		if err != nil {
-			return err
-		}
+	//RetryOnConflict make an update to a resource when other code also doing change at same time
+	//If conflict occurs it will wait for sometime
+	// var DefaultRetry = wait.Backoff{
+	// 	Steps:    5,
+	// 	Duration: 10 * time.Millisecond,
+	// 	Factor:   1.0,
+	// 	Jitter:   0.1,
+	// }
+	//https://pkg.go.dev/k8s.io/apimachinery/pkg/util/wait#Backoff
+	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 
-		//Create a new client instance for config
-		clientset, err := kubernetes.NewForConfig(config)
-		if err != nil {
-			return err
-		}
+		//Get the specified deployment
+		//passing empty context
+		//Since no information required for Get like deadline, cancellation etc.
 
-		// fmt.Printf("current namespace = %s\n", rawconfig.Contexts[rawconfig.CurrentContext].Namespace)
-		// fmt.Printf("config flags namespace = %s\n", *o.configFlags.Namespace)
-		// fmt.Printf("Default Namespace = %s\n", apiv1.NamespaceDefault)
-		//logic for User specified namespace
-		//Ask if the current context can be NULL or not
+		result, getErr := o.deploymentsClient.Get(context.TODO(), o.deploymentName, metav1.GetOptions{})
 
-		//If namespace is provided in the flags
-		userSpecifiedNamespace := *o.configFlags.Namespace
-
-		//If not specified use default namespace
-		if len(userSpecifiedNamespace) == 0 {
-			userSpecifiedNamespace = rawconfig.Contexts[rawconfig.CurrentContext].Namespace
-
+		if getErr != nil {
+			return fmt.Errorf("failed to get latest version fo Deployment: %v", getErr)
 		}
 
-		//Get deployment client in the specified namespace
-		deploymentsClient := clientset.AppsV1().Deployments(userSpecifiedNamespace)
+		result.Spec.Replicas = &o.newReplicas
+		result.Spec.RevisionHistoryLimit = &o.newRhl
+		_, updateErr := o.deploymentsClient.Update(context.TODO(), result, metav1.UpdateOptions{})
+		return updateErr
+	})
 
-		//RetryOnConflict make an update to a resource when other code also doing change at same time
-		//If conflict occurs it will wait for sometime
-		// var DefaultRetry = wait.Backoff{
-		// 	Steps:    5,
-		// 	Duration: 10 * time.Millisecond,
-		// 	Factor:   1.0,
-		// 	Jitter:   0.1,
-		// }
-		//https://pkg.go.dev/k8s.io/apimachinery/pkg/util/wait#Backoff
-		retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-
-			//Get the specified deployment
-			//passing empty context
-			//Since no information required for Get like deadline, cancellation etc.
-
-			result, getErr := deploymentsClient.Get(context.TODO(), o.deploymentName, metav1.GetOptions{})
-
-			if getErr != nil {
-				return fmt.Errorf("failed to get latest version fo Deployment: %v", getErr)
-				// return getErr
-			}
-
-			result.Spec.Replicas = &o.newReplicas
-			_, updateErr := deploymentsClient.Update(context.TODO(), result, metav1.UpdateOptions{})
-			return updateErr
-		})
-
-		if retryErr != nil {
-			return fmt.Errorf("update failed: %v", retryErr)
-			// return retryErr
-		}
-		fmt.Println("Updated Deployment..")
+	if retryErr != nil {
+		return fmt.Errorf("update failed: %v", retryErr)
 	}
+	fmt.Println("Updated Deployment..")
+
 	return nil
 }
 
